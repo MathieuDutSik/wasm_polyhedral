@@ -18,9 +18,18 @@ dist/                 Built artifacts. Committed so consumers don't need a
 
 ## Bindings
 
-| Binding | Entry symbol       | Source                   |
-|---------|--------------------|--------------------------|
-| `copos` | `testCopositivity` | `src/copos_bindings.cpp` |
+The current module exposes one combined binary (`polyhedral.{js,wasm}`)
+holding every WASM entry point. Each entry registers via
+`emscripten::function(...)` in `src/polyhedral_bindings.cpp`:
+
+| JS function name                       | Polyhedral_common routine                |
+|----------------------------------------|------------------------------------------|
+| `testCopositivity`                     | `TestCopositivity`                       |
+| `testStrictCopositivity`               | `TestStrictCopositivity`                 |
+| `testCopositiveFactorization`          | `TestingAttemptStrictPositivity`         |
+| `testShortestVectorsRealizability`     | `SHORT_TestRealizabilityShortestFamily`  |
+| `shortestVectorsAutomorphismGroup`     | `SHORT_GetStabilizer`                    |
+| `gramCanonicalForm`                    | `ComputeCanonicalForm`                   |
 
 ## Building locally
 
@@ -46,13 +55,13 @@ The script runs a node-based smoke test at the end. If it prints
 In the static-site repo (`mathieudutsik.github.io`):
 
 ```bash
-./pull-wasm.sh         # copies dist/copos.{js,wasm} into wasm/
+./pull-wasm.sh         # copies dist/polyhedral.{js,wasm} into wasm/
 ```
 
-then commit the result. The page loads `/wasm/copos.js` and calls:
+then commit the result. The page loads `/wasm/polyhedral.js` and calls:
 
 ```js
-const m = await createCoposModule();
+const m = await createPolyhedralModule();
 const r = m.testCopositivity(3, ["1","0","0","0","1","0","0","0","1"]);
 // r.isCopositive : bool
 // r.nature       : string
@@ -61,8 +70,8 @@ const r = m.testCopositivity(3, ["1","0","0","0","1","0","0","0","1"]);
 
 ## Adding a new binding
 
-1. Drop a new `src/<name>_bindings.cpp` next to `copos_bindings.cpp`.
-2. Extend `build.sh` to compile it (single-source build for now —
-   intentional, since each binding becomes one cohesive `.wasm` module).
-3. Bump the table above and add a corresponding `pull-wasm.sh` line in
-   the site repo.
+1. Add the entry-point function inside `src/polyhedral_bindings.cpp` and
+   register it in the `EMSCRIPTEN_BINDINGS(polyhedral_module)` block.
+2. Extend the node smoke test at the bottom of `build.sh` to exercise it.
+3. Bump the table above and (if the binding needs a new include path)
+   the `INCLUDES` array in `build.sh`.
