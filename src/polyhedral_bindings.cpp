@@ -33,6 +33,7 @@
 
 #include <emscripten/bind.h>
 #include <emscripten/val.h>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -95,6 +96,37 @@ struct CanonicalFormResultJS {
     std::vector<std::string> canonicalFlat;   // length n*n rationals (B * eMat * B^T)
     std::string error;
 };
+
+// Scoped redirection of std::cerr into a caller-supplied buffer. polyhedral_common
+// reports fatal conditions by writing a human-readable message to std::cerr and
+// then `throw TerminalException{1};`. Without this redirect, the message lands
+// on the (invisible) WASM stderr and the JS layer only sees the bare throw. With
+// the redirect, the captured text is what we hand back via result.error.
+//
+// Lifetime: install at the top of every binding call, restore on destruction.
+// Not thread-safe — fine here, the WASM main thread runs one binding at a time.
+class CerrRedirect {
+public:
+    explicit CerrRedirect(std::ostringstream &sink)
+        : prev_(std::cerr.rdbuf(sink.rdbuf())) {}
+    ~CerrRedirect() { std::cerr.rdbuf(prev_); }
+    CerrRedirect(CerrRedirect const &) = delete;
+    CerrRedirect &operator=(CerrRedirect const &) = delete;
+private:
+    std::streambuf *prev_;
+};
+
+// Build the user-facing error string from whatever polyhedral_common emitted
+// before throwing — both via `std::cerr` (redirected here) and via the `os`
+// parameter we pass to its routines. Strips trailing newlines so it renders
+// cleanly inline in the status bar.
+static std::string formatPolyhedralError(std::ostringstream const &sink,
+                                         char const *fallback) {
+    std::string log = sink.str();
+    while (!log.empty() && (log.back() == '\n' || log.back() == '\r')) log.pop_back();
+    if (log.empty()) return fallback;
+    return std::string("polyhedral_common error: ") + log;
+}
 
 // boost::multiprecision::cpp_int's string constructor is lenient on some
 // inputs (e.g. parses "Q" as 0 silently on certain builds) so we validate
@@ -193,32 +225,40 @@ static void fillResult(CopositivityTestResult<cpp_int> const &r,
 // field of the result rather than as exceptions.
 CopositivityResultJS testCopositivity(int n, emscripten::val const &entries_val) {
     CopositivityResultJS out;
+    std::ostringstream sink;
+    CerrRedirect redir(sink);
     try {
         MyMatrix<cpp_rational> M;
         if (!buildMatrix(n, entries_val, M, out)) return out;
-        std::ostringstream sink;
         MyMatrix<cpp_int> InitialBasis = IdentityMat<cpp_int>(n);
         fillResult(TestCopositivity<cpp_rational, cpp_int>(M, InitialBasis, sink), out);
+    } catch (TerminalException const &) {
+        out.error = formatPolyhedralError(sink,
+            "polyhedral_common reported a fatal error during copositivity test");
     } catch (std::exception const &e) {
         out.error = std::string("Internal error: ") + e.what();
     } catch (...) {
-        out.error = "Unknown internal error";
+        out.error = formatPolyhedralError(sink, "Unknown internal error");
     }
     return out;
 }
 
 CopositivityResultJS testStrictCopositivity(int n, emscripten::val const &entries_val) {
     CopositivityResultJS out;
+    std::ostringstream sink;
+    CerrRedirect redir(sink);
     try {
         MyMatrix<cpp_rational> M;
         if (!buildMatrix(n, entries_val, M, out)) return out;
-        std::ostringstream sink;
         MyMatrix<cpp_int> InitialBasis = IdentityMat<cpp_int>(n);
         fillResult(TestStrictCopositivity<cpp_rational, cpp_int>(M, InitialBasis, sink), out);
+    } catch (TerminalException const &) {
+        out.error = formatPolyhedralError(sink,
+            "polyhedral_common reported a fatal error during strict copositivity test");
     } catch (std::exception const &e) {
         out.error = std::string("Internal error: ") + e.what();
     } catch (...) {
-        out.error = "Unknown internal error";
+        out.error = formatPolyhedralError(sink, "Unknown internal error");
     }
     return out;
 }
@@ -230,6 +270,8 @@ FactorizationResultJS testCopositiveFactorization(int n, emscripten::val const &
     FactorizationResultJS out;
     out.dim = 0;
     out.nBlocks = 0;
+    std::ostringstream sink;
+    CerrRedirect redir(sink);
     try {
         MyMatrix<cpp_rational> M;
         // Reuse buildMatrix's parsing by going through a CopositivityResultJS
@@ -242,7 +284,6 @@ FactorizationResultJS testCopositiveFactorization(int n, emscripten::val const &
             }
         }
         out.dim = n;
-        std::ostringstream sink;
         MyMatrix<cpp_int> InitialBasis = IdentityMat<cpp_int>(n);
         TestStrictPositivity<cpp_rational, cpp_int> r =
             TestingAttemptStrictPositivity<cpp_rational, cpp_int>(M, InitialBasis, sink);
@@ -275,10 +316,13 @@ FactorizationResultJS testCopositiveFactorization(int n, emscripten::val const &
                 }
             }
         }
+    } catch (TerminalException const &) {
+        out.error = formatPolyhedralError(sink,
+            "polyhedral_common reported a fatal error during copositive factorization");
     } catch (std::exception const &e) {
         out.error = std::string("Internal error: ") + e.what();
     } catch (...) {
-        out.error = "Unknown internal error";
+        out.error = formatPolyhedralError(sink, "Unknown internal error");
     }
     return out;
 }
@@ -335,11 +379,22 @@ RealizabilityResultJS testShortestVectorsRealizability(
         int nRows, int nCols, emscripten::val const &entries_val) {
     RealizabilityResultJS out;
     out.dim = 0;
+    std::ostringstream sink;
+    CerrRedirect redir(sink);
     try {
         MyMatrix<cpp_int> SHV;
         if (!buildIntMatrix(nRows, nCols, entries_val, SHV, out.error)) return out;
         out.dim = nCols;
-        std::ostringstream sink;
+        // The realizability test assumes the configuration spans Q^nCols;
+        // a rank-deficient input would have the inner LLL/Gram-extraction
+        // path trip on an empty/degenerate matrix.
+        int rank = RankMat(SHV);
+        if (rank < nCols) {
+            out.error = "Vector configuration is rank " + std::to_string(rank) +
+                        " in dimension " + std::to_string(nCols) +
+                        "; full rank (= nCols) is required.";
+            return out;
+        }
         ReplyRealizability<cpp_rational, cpp_int> r =
             SHORT_TestRealizabilityShortestFamily<cpp_rational, cpp_int, Tgroup>(SHV, sink);
         out.realizable = r.reply;
@@ -354,10 +409,13 @@ RealizabilityResultJS testShortestVectorsRealizability(
                 }
             }
         }
+    } catch (TerminalException const &) {
+        out.error = formatPolyhedralError(sink,
+            "polyhedral_common reported a fatal error during shortest-vector realizability test");
     } catch (std::exception const &e) {
         out.error = std::string("Internal error: ") + e.what();
     } catch (...) {
-        out.error = "Unknown internal error";
+        out.error = formatPolyhedralError(sink, "Unknown internal error");
     }
     return out;
 }
@@ -367,11 +425,22 @@ AutomorphismResultJS shortestVectorsAutomorphismGroup(
     AutomorphismResultJS out;
     out.dim = 0;
     out.nGenerators = 0;
+    std::ostringstream sink;
+    CerrRedirect redir(sink);
     try {
         MyMatrix<cpp_int> SHV;
         if (!buildIntMatrix(nRows, nCols, entries_val, SHV, out.error)) return out;
         out.dim = nCols;
-        std::ostringstream sink;
+        // Stabilizer computation assumes the configuration spans Q^nCols;
+        // a rank-deficient input would otherwise feed a degenerate Gram into
+        // the inner shortest-vector routines.
+        int rank = RankMat(SHV);
+        if (rank < nCols) {
+            out.error = "Vector configuration is rank " + std::to_string(rank) +
+                        " in dimension " + std::to_string(nCols) +
+                        "; full rank (= nCols) is required.";
+            return out;
+        }
         std::vector<MyMatrix<cpp_int>> generators =
             SHORT_GetStabilizer<cpp_rational, cpp_int, Tgroup>(SHV, sink);
         out.nGenerators = static_cast<int>(generators.size());
@@ -387,10 +456,13 @@ AutomorphismResultJS shortestVectorsAutomorphismGroup(
                 }
             }
         }
+    } catch (TerminalException const &) {
+        out.error = formatPolyhedralError(sink,
+            "polyhedral_common reported a fatal error during shortest-vector automorphism computation");
     } catch (std::exception const &e) {
         out.error = std::string("Internal error: ") + e.what();
     } catch (...) {
-        out.error = "Unknown internal error";
+        out.error = formatPolyhedralError(sink, "Unknown internal error");
     }
     return out;
 }
@@ -398,6 +470,8 @@ AutomorphismResultJS shortestVectorsAutomorphismGroup(
 CanonicalFormResultJS gramCanonicalForm(int n, emscripten::val const &entries_val) {
     CanonicalFormResultJS out;
     out.dim = 0;
+    std::ostringstream sink;
+    CerrRedirect redir(sink);
     try {
         MyMatrix<cpp_rational> M;
         {
@@ -408,7 +482,14 @@ CanonicalFormResultJS gramCanonicalForm(int n, emscripten::val const &entries_va
             }
         }
         out.dim = n;
-        std::ostringstream sink;
+        // Canonicalization is only well-defined for positive-definite Gram
+        // matrices — the inner shortest-vector enumeration would otherwise
+        // return an empty family and downstream Eigen access tramples OOB.
+        if (!IsPositiveDefinite(M, sink)) {
+            out.error = "Matrix is not positive definite; "
+                        "Gram-matrix canonicalization requires a positive-definite form.";
+            return out;
+        }
         MyMatrix<cpp_int> B = ComputeCanonicalForm<cpp_rational, cpp_int>(M, sink);
         MyMatrix<cpp_rational> B_T = UniversalMatrixConversion<cpp_rational, cpp_int>(B);
         MyMatrix<cpp_rational> canonical = B_T * M * B_T.transpose();
@@ -425,10 +506,13 @@ CanonicalFormResultJS gramCanonicalForm(int n, emscripten::val const &entries_va
                 out.canonicalFlat.push_back(ec.str());
             }
         }
+    } catch (TerminalException const &) {
+        out.error = formatPolyhedralError(sink,
+            "polyhedral_common reported a fatal error during Gram-matrix canonicalization");
     } catch (std::exception const &e) {
         out.error = std::string("Internal error: ") + e.what();
     } catch (...) {
-        out.error = "Unknown internal error";
+        out.error = formatPolyhedralError(sink, "Unknown internal error");
     }
     return out;
 }
