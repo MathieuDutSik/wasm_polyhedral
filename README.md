@@ -31,6 +31,8 @@ holding every WASM entry point. Each entry registers via
 | `shortestVectorsAutomorphismGroup`     | `SHORT_GetStabilizer`                    |
 | `gramCanonicalForm`                    | `ComputeCanonicalForm`                   |
 | `polytopeNormDensities`                | `ComputePolyNormPacking`, `ComputePolyNormCovering` |
+| `isMinimalCovering`                    | `PolyNorm_IsMinimalCovering`             |
+| `minimalCoveringPolytope`              | `PolyNorm_MinimalCoveringPolytopeGrid`, `PolyNorm_MinimalCoveringPolytope` |
 
 ## Building locally
 

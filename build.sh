@@ -256,6 +256,34 @@ create().then(m => {
     console.log("polynorm unbounded :", JSON.stringify({error: r13.error}));
     if (!r13.error) { console.error("expected an error"); process.exit(1); }
 
+    // Minimal covering test: the unit square is minimal covering, the
+    // rectangle [0,3/2] x [0,1] is covering but not minimal, and the
+    // triangle conv(0, e_1, e_2) is not covering (mu = 2).
+    const sq = ["0","0","1","0","0","1","1","1"];
+    const rect = ["0","0","3/2","0","0","1","3/2","1"];
+    const r14 = m.isMinimalCovering("vertices", 4, 2, sq);
+    console.log("mincov square :", JSON.stringify({isCovering: r14.isCovering,
+        isMinimal: r14.isMinimal, error: r14.error}));
+    if (r14.error || !r14.isCovering || !r14.isMinimal) process.exit(1);
+    const r15 = m.isMinimalCovering("vertices", 4, 2, rect);
+    console.log("mincov rectangle :", JSON.stringify({isCovering: r15.isCovering,
+        isMinimal: r15.isMinimal, nCuttable: r15.nCuttable, error: r15.error}));
+    if (r15.error || !r15.isCovering || r15.isMinimal || r15.nCuttable === 0) process.exit(1);
+    const r16 = m.isMinimalCovering("vertices", 3, 2, ["0","0","1","0","0","1"]);
+    console.log("mincov triangle :", JSON.stringify({isCovering: r16.isCovering,
+        mu: r16.mu, error: r16.error}));
+    if (r16.error || r16.isCovering || r16.mu !== "2") process.exit(1);
+    // A minimal covering polytope in the rectangle: a unit square.
+    const r17 = m.minimalCoveringPolytope("vertices", 4, 2, rect, "grid", 1, 3);
+    console.log("mincov grid rectangle :", JSON.stringify({muInput: r17.muInput,
+        isMinimal: r17.isMinimal, isTile: r17.isTile, volume: r17.volume,
+        vertices: flat(r17.verticesFlat), error: r17.error}));
+    if (r17.error || !r17.isMinimal || r17.volume !== "1") process.exit(1);
+    const r18 = m.minimalCoveringPolytope("vertices", 4, 2, rect, "reduction", 1000, 0);
+    console.log("mincov reduction rectangle :", JSON.stringify({isMinimal: r18.isMinimal,
+        volume: r18.volume, error: r18.error}));
+    if (r18.error || !r18.isMinimal) process.exit(1);
+
     console.log("smoke test OK");
 });
 '

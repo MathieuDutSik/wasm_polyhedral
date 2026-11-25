@@ -3,7 +3,8 @@
 // WebAssembly bindings (Emscripten / embind) exposing selected entry points
 // of polyhedral_common to JavaScript: copositivity, copositive factorization,
 // shortest-vector realizability and automorphism group, Gram-matrix
-// canonicalization, and the packing and covering densities of a polytope.
+// canonicalization, the packing and covering densities of a polytope, and
+// minimal covering polytopes.
 //
 // JS API (after loading the module):
 //   const m = await createPolyhedralModule();
@@ -32,6 +33,7 @@
 #include "POLY_DirectTriangulation.h"
 #include "PolyNorm_Packing.h"
 #include "PolyNorm_Covering.h"
+#include "PolyNorm_MinimalCovering.h"
 // clang-format on
 
 #include <emscripten/bind.h>
@@ -644,6 +646,59 @@ static bool verticesFromZonotope(MyMatrix<cpp_rational> const &V,
     return true;
 }
 
+// The homogeneous vertex matrix (rows (1, v)) of the polytope given by the
+// rows v_i of the nRows x nCols matrix `entries`, read according to inputType:
+//   "vertices"     P = conv(v_1, ..., v_M)
+//   "inequalities" P = {x : v_i . x <= 1}
+//   "zonotope"     P = v_1 [0,1] + ... + v_M [0,1]
+// For "vertices" the rows that are repeated or not vertices are kept; the
+// callers drop them.
+static bool buildPolytope(std::string const &inputType, int nRows, int nCols,
+                          emscripten::val const &entries_val,
+                          MyMatrix<cpp_rational> &EXT, std::string &out_error,
+                          std::ostream &os) {
+    MyMatrix<cpp_rational> V;
+    if (!buildRationalMatrix(nRows, nCols, entries_val, V, out_error)) return false;
+    if (inputType == "vertices") {
+        EXT = homogenize(V);
+        if (RankMat(EXT) != nCols + 1) {
+            out_error = "The points do not span an n-dimensional polytope";
+            return false;
+        }
+        return true;
+    }
+    if (inputType == "inequalities") return verticesFromInequalities(V, EXT, out_error, os);
+    if (inputType == "zonotope") return verticesFromZonotope(V, EXT, out_error, os);
+    out_error = "Unknown input type \"" + inputType +
+                "\", allowed: vertices, inequalities, zonotope";
+    return false;
+}
+
+// The rows of a homogeneous matrix without their first coordinate, flattened.
+static std::vector<std::string> flattenAffine(MyMatrix<cpp_rational> const &EXT) {
+    std::vector<std::string> flat;
+    for (int i = 0; i < EXT.rows(); ++i) {
+        for (int j = 1; j < EXT.cols(); ++j) {
+            std::ostringstream oss;
+            oss << EXT(i, j);
+            flat.push_back(oss.str());
+        }
+    }
+    return flat;
+}
+
+static std::vector<std::string> flattenMatrix(MyMatrix<cpp_rational> const &M) {
+    std::vector<std::string> flat;
+    for (int i = 0; i < M.rows(); ++i) {
+        for (int j = 0; j < M.cols(); ++j) {
+            std::ostringstream oss;
+            oss << M(i, j);
+            flat.push_back(oss.str());
+        }
+    }
+    return flat;
+}
+
 static std::string toStr(cpp_rational const &x) {
     std::ostringstream oss;
     oss << x;
@@ -682,25 +737,10 @@ PolyNormResultJS polytopeNormDensities(std::string const &inputType, int nRows, 
             out.error = "Unknown computation \"" + what + "\", allowed: both, packing, covering";
             return out;
         }
-        MyMatrix<cpp_rational> V;
-        if (!buildRationalMatrix(nRows, nCols, entries_val, V, out.error)) return out;
         int n = nCols;
         MyMatrix<cpp_rational> EXT;
-        if (inputType == "vertices") {
-            EXT = homogenize(V);
-            if (RankMat(EXT) != n + 1) {
-                out.error = "The points do not span an n-dimensional polytope";
-                return out;
-            }
-        } else if (inputType == "inequalities") {
-            if (!verticesFromInequalities(V, EXT, out.error, sink)) return out;
-        } else if (inputType == "zonotope") {
-            if (!verticesFromZonotope(V, EXT, out.error, sink)) return out;
-        } else {
-            out.error = "Unknown input type \"" + inputType +
-                        "\", allowed: vertices, inequalities, zonotope";
+        if (!buildPolytope(inputType, nRows, nCols, entries_val, EXT, out.error, sink))
             return out;
-        }
         PolyNormData<cpp_rational, cpp_int, Tgroup> data =
             PolyNorm_BuildData<cpp_rational, cpp_int, Tgroup>(EXT, sink);
         out.dim = n;
@@ -763,6 +803,167 @@ PolyNormResultJS polytopeNormDensities(std::string const &inputType, int nRows, 
     return out;
 }
 
+// Result of isMinimalCovering: whether P is covering (P + Z^n = R^n) and
+// minimal covering (no convex body strictly contained in P is covering),
+// with the vertices of P that can be cut keeping the covering.
+struct MinimalCoveringTestResultJS {
+    int dim;
+    int nVertices;
+    int nFacets;
+    std::vector<std::string> verticesFlat;   // nVertices * dim, row-major
+    std::string volume;
+    bool isCovering;
+    bool isMinimal;
+    std::string mu;                          // covering radius, set when not covering
+    int nCuttable;
+    std::vector<std::string> cuttableFlat;   // nCuttable * dim, row-major
+    std::string error;
+};
+
+// Result of minimalCoveringPolytope: a covering polytope Q contained in
+// mu(P) P, and whether it is proved minimal covering.
+struct MinimalCoveringResultJS {
+    int dim;
+    std::string muInput;                     // covering radius of P
+    bool isCovering;                         // mu(P) <= 1
+    bool isMinimal;
+    bool isTile;                             // vol(Q) = 1 (grid method)
+    std::string description;                 // statistics of the method
+    int nVertices;
+    std::vector<std::string> verticesFlat;   // nVertices * dim, row-major
+    int nFacets;
+    std::vector<std::string> facetsFlat;     // nFacets * (dim + 1): (b, a), b + a.x >= 0
+    std::string volume;
+    std::string error;
+};
+
+MinimalCoveringTestResultJS isMinimalCovering(std::string const &inputType, int nRows,
+                                              int nCols, emscripten::val const &entries_val) {
+    MinimalCoveringTestResultJS out;
+    out.dim = 0;
+    out.nVertices = 0;
+    out.nFacets = 0;
+    out.isCovering = false;
+    out.isMinimal = false;
+    out.nCuttable = 0;
+    std::ostringstream sink;
+    CerrRedirect redir(sink);
+    try {
+        MyMatrix<cpp_rational> EXT_input;
+        if (!buildPolytope(inputType, nRows, nCols, entries_val, EXT_input, out.error, sink))
+            return out;
+        MyMatrix<cpp_rational> EXT = SelectRow(
+            EXT_input, get_distinct_extreme_rays_indices(EXT_input, sink));
+        MyMatrix<cpp_rational> FAC = PolyNorm_MinCovFacets(EXT, sink);
+        PolyNormIsMinimalCovering<cpp_rational> res =
+            PolyNorm_IsMinimalCovering<cpp_rational, cpp_int, Tgroup>(EXT, FAC, sink);
+        out.dim = nCols;
+        out.nVertices = EXT.rows();
+        out.nFacets = FAC.rows();
+        out.verticesFlat = flattenAffine(EXT);
+        out.volume = toStr(PolyNorm_MinCovVolume(EXT, sink));
+        out.isCovering = res.is_covering;
+        out.isMinimal = res.is_minimal;
+        if (!res.is_covering) {
+            out.mu = toStr(PolyNorm_MinCovCoveringRadius<cpp_rational, cpp_int, Tgroup>(EXT, sink));
+        }
+        out.nCuttable = static_cast<int>(res.ListCuttable.size());
+        for (int iv : res.ListCuttable) {
+            for (int j = 0; j < nCols; ++j) out.cuttableFlat.push_back(toStr(EXT(iv, j + 1)));
+        }
+    } catch (TerminalException const &) {
+        out.error = formatPolyhedralError(sink,
+            "polyhedral_common reported a fatal error during the minimal covering test");
+    } catch (std::exception const &e) {
+        out.error = std::string("Internal error: ") + e.what();
+    } catch (...) {
+        out.error = formatPolyhedralError(sink, "Unknown internal error");
+    }
+    return out;
+}
+
+// A minimal covering polytope inside mu(P) P.
+//   method : "grid"      param1 = N >= 1, param2 = n_round >= 1
+//            "reduction" param1 = the maximal number of reductions
+MinimalCoveringResultJS minimalCoveringPolytope(std::string const &inputType, int nRows,
+                                                int nCols, emscripten::val const &entries_val,
+                                                std::string const &method, int param1,
+                                                int param2) {
+    MinimalCoveringResultJS out;
+    out.dim = 0;
+    out.isCovering = false;
+    out.isMinimal = false;
+    out.isTile = false;
+    out.nVertices = 0;
+    out.nFacets = 0;
+    std::ostringstream sink;
+    CerrRedirect redir(sink);
+    try {
+        MyMatrix<cpp_rational> EXT;
+        if (!buildPolytope(inputType, nRows, nCols, entries_val, EXT, out.error, sink))
+            return out;
+        out.dim = nCols;
+        std::ostringstream desc;
+        MyMatrix<cpp_rational> EXTres, FACres;
+        if (method == "grid") {
+            if (param1 < 1 || param2 < 1) {
+                out.error = "The grid method needs N >= 1 and at least one round";
+                return out;
+            }
+            PolyNormMinimalCoveringGrid<cpp_rational> res =
+                PolyNorm_MinimalCoveringPolytopeGrid<cpp_rational, cpp_int, Tgroup>(
+                    EXT, param1, param2, sink);
+            out.muInput = toStr(res.mu_input);
+            out.isCovering = res.is_covering;
+            if (!res.is_covering) return out;
+            out.isMinimal = res.is_minimal;
+            out.isTile = res.is_tile;
+            desc << "Grid method: " << res.n_round << " round(s), last grid (1/"
+                 << res.N_last << ") Z^n with " << res.n_point << " candidate points, "
+                 << res.n_drop << " points dropped, " << res.n_covering_test
+                 << " covering tests, " << res.n_lp
+                 << " linear programs for the local tests of the vertices.";
+            EXTres = res.EXT;
+            FACres = res.FAC;
+        } else if (method == "reduction") {
+            if (param1 < 1) {
+                out.error = "The reduction method needs at least one reduction step";
+                return out;
+            }
+            PolyNormMinimalCovering<cpp_rational> res =
+                PolyNorm_MinimalCoveringPolytope<cpp_rational, cpp_int, Tgroup>(
+                    EXT, static_cast<size_t>(param1), sink);
+            out.muInput = toStr(res.mu_input);
+            out.isCovering = res.is_covering;
+            if (!res.is_covering) return out;
+            out.isMinimal = res.is_minimal;
+            desc << "Reductions after the shrinking by mu: " << res.n_remove
+                 << " vertices removed, " << res.n_push << " facets pushed, "
+                 << res.n_cut << " vertices cut; " << res.n_node << " nodes, "
+                 << res.n_lp << " linear programs.";
+            EXTres = res.EXT;
+            FACres = res.FAC;
+        } else {
+            out.error = "Unknown method \"" + method + "\", allowed: grid, reduction";
+            return out;
+        }
+        out.description = desc.str();
+        out.nVertices = EXTres.rows();
+        out.verticesFlat = flattenAffine(EXTres);
+        out.nFacets = FACres.rows();
+        out.facetsFlat = flattenMatrix(FACres);
+        out.volume = toStr(PolyNorm_MinCovVolume(EXTres, sink));
+    } catch (TerminalException const &) {
+        out.error = formatPolyhedralError(sink,
+            "polyhedral_common reported a fatal error during the minimal covering computation");
+    } catch (std::exception const &e) {
+        out.error = std::string("Internal error: ") + e.what();
+    } catch (...) {
+        out.error = formatPolyhedralError(sink, "Unknown internal error");
+    }
+    return out;
+}
+
 EMSCRIPTEN_BINDINGS(polyhedral_module) {
     emscripten::value_object<CopositivityResultJS>("CopositivityResult")
         .field("isCopositive", &CopositivityResultJS::isCopositive)
@@ -817,6 +1018,33 @@ EMSCRIPTEN_BINDINGS(polyhedral_module) {
         .field("tightFlat", &PolyNormResultJS::tightFlat)
         .field("error", &PolyNormResultJS::error);
 
+    emscripten::value_object<MinimalCoveringTestResultJS>("MinimalCoveringTestResult")
+        .field("dim", &MinimalCoveringTestResultJS::dim)
+        .field("nVertices", &MinimalCoveringTestResultJS::nVertices)
+        .field("nFacets", &MinimalCoveringTestResultJS::nFacets)
+        .field("verticesFlat", &MinimalCoveringTestResultJS::verticesFlat)
+        .field("volume", &MinimalCoveringTestResultJS::volume)
+        .field("isCovering", &MinimalCoveringTestResultJS::isCovering)
+        .field("isMinimal", &MinimalCoveringTestResultJS::isMinimal)
+        .field("mu", &MinimalCoveringTestResultJS::mu)
+        .field("nCuttable", &MinimalCoveringTestResultJS::nCuttable)
+        .field("cuttableFlat", &MinimalCoveringTestResultJS::cuttableFlat)
+        .field("error", &MinimalCoveringTestResultJS::error);
+
+    emscripten::value_object<MinimalCoveringResultJS>("MinimalCoveringResult")
+        .field("dim", &MinimalCoveringResultJS::dim)
+        .field("muInput", &MinimalCoveringResultJS::muInput)
+        .field("isCovering", &MinimalCoveringResultJS::isCovering)
+        .field("isMinimal", &MinimalCoveringResultJS::isMinimal)
+        .field("isTile", &MinimalCoveringResultJS::isTile)
+        .field("description", &MinimalCoveringResultJS::description)
+        .field("nVertices", &MinimalCoveringResultJS::nVertices)
+        .field("verticesFlat", &MinimalCoveringResultJS::verticesFlat)
+        .field("nFacets", &MinimalCoveringResultJS::nFacets)
+        .field("facetsFlat", &MinimalCoveringResultJS::facetsFlat)
+        .field("volume", &MinimalCoveringResultJS::volume)
+        .field("error", &MinimalCoveringResultJS::error);
+
     emscripten::register_vector<std::string>("VectorString");
 
     emscripten::function("testCopositivity", &testCopositivity);
@@ -826,4 +1054,6 @@ EMSCRIPTEN_BINDINGS(polyhedral_module) {
     emscripten::function("shortestVectorsAutomorphismGroup", &shortestVectorsAutomorphismGroup);
     emscripten::function("gramCanonicalForm", &gramCanonicalForm);
     emscripten::function("polytopeNormDensities", &polytopeNormDensities);
+    emscripten::function("isMinimalCovering", &isMinimalCovering);
+    emscripten::function("minimalCoveringPolytope", &minimalCoveringPolytope);
 }
