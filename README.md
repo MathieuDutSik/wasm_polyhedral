@@ -30,6 +30,7 @@ holding every WASM entry point. Each entry registers via
 | `testShortestVectorsRealizability`     | `SHORT_TestRealizabilityShortestFamily`  |
 | `shortestVectorsAutomorphismGroup`     | `SHORT_GetStabilizer`                    |
 | `gramCanonicalForm`                    | `ComputeCanonicalForm`                   |
+| `polytopeNormDensities`                | `ComputePolyNormPacking`, `ComputePolyNormCovering` |
 
 ## Building locally
 

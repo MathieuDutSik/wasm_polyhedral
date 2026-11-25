@@ -18,8 +18,9 @@ cd "$(dirname "$0")"
 
 # --- Paths -------------------------------------------------------------------
 
-POLYHEDRAL_COMMON_DEFAULT="$(cd ../../GITmathieu/polyhedral_common && pwd)"
-POLYHEDRAL_COMMON="${POLYHEDRAL_COMMON:-$POLYHEDRAL_COMMON_DEFAULT}"
+# The default is only resolved when the env var is unset: under `set -e` a
+# failing `cd` would otherwise abort the script even with an override.
+POLYHEDRAL_COMMON="${POLYHEDRAL_COMMON:-$(cd ../../GITmathieu/polyhedral_common && pwd)}"
 
 if [ ! -d "$POLYHEDRAL_COMMON/src_copos" ]; then
     echo "polyhedral_common not found at $POLYHEDRAL_COMMON" >&2
@@ -45,7 +46,9 @@ mkdir -p dist build
 # libnauty. nauty's configure runs feature probes that crash under wasm-ld;
 # we disable them with --host=wasm32-unknown-emscripten + --disable-* below.
 # Mirrors the recipe in polyhedral_common/src_export_wasm/build.sh.
-NAUTY_TAG="${NAUTY_TAG:-2.9.3}"
+# GRAPH_traces.h needs the exact group order from Traces (the `cnt` field of
+# TracesStats), which only this branch provides.
+NAUTY_TAG="${NAUTY_TAG:-traces-grpsize-factors}"
 NAUTY_REPO="${NAUTY_REPO:-https://github.com/MathieuDutSik/nauty}"
 NAUTY_SRC="$(pwd)/build/nauty-src"
 NAUTY_INSTALL="$(pwd)/build/nauty-install"
@@ -102,6 +105,9 @@ INCLUDES=(
     -I"$POLYHEDRAL_COMMON/permutalib/src"
     -I"$POLYHEDRAL_COMMON/src_perfect"
     -I"$POLYHEDRAL_COMMON/src_lorentzian"
+    -I"$POLYHEDRAL_COMMON/src_dualdesc"
+    -I"$POLYHEDRAL_COMMON/src_enum_schemes"
+    -I"$POLYHEDRAL_COMMON/src_polynorm"
     -I"$NAUTY_INC"
     -I"$BOOST_INC"
     -I"$EIGEN_INC"
@@ -146,7 +152,7 @@ OUT_JS=dist/polyhedral.js
 OUT_WASM=dist/polyhedral.wasm
 
 echo "==> Building $SRC -> $OUT_JS, $OUT_WASM"
-emcc "${CXXFLAGS[@]}" "${INCLUDES[@]}" "${LINKFLAGS[@]}" "$SRC" "$NAUTY_LIB" -o "$OUT_JS"
+em++ "${CXXFLAGS[@]}" "${INCLUDES[@]}" "${LINKFLAGS[@]}" "$SRC" "$NAUTY_LIB" -o "$OUT_JS"
 
 echo "==> Artifact sizes:"
 ls -lh "$OUT_JS" "$OUT_WASM"
@@ -222,6 +228,33 @@ create().then(m => {
     }
     console.log("canon I_2 :", JSON.stringify({dim: r11.dim, canonical, error: r11.error}));
     if (r11.error || r11.dim !== 2) process.exit(1);
+
+    // Packing / covering of the square [0,1]^2 (alpha = mu = 1, densities 1),
+    // given in the three input forms.
+    const flat = (v) => { const a = []; for (let i = 0; i < v.size(); ++i) a.push(v.get(i)); return a; };
+    const pn = [
+        ["vertices", 4, ["0","0","1","0","0","1","1","1"]],
+        ["inequalities", 4, ["2","0","-2","0","0","2","0","-2"]],
+        ["zonotope", 2, ["1","0","0","1"]],
+    ];
+    for (const [kind, rows, entries] of pn) {
+        const r = m.polytopeNormDensities(kind, rows, 2, entries, "both");
+        console.log("polynorm square " + kind + " :", JSON.stringify({alpha: r.alpha, mu: r.mu,
+            packingDensity: r.packingDensity, coveringDensity: r.coveringDensity,
+            volume: r.volume, vertices: flat(r.verticesFlat), error: r.error}));
+        if (r.error || r.alpha !== "1" || r.mu !== "1" || r.volume !== "1") process.exit(1);
+    }
+    // Cross polytope conv(+-e_i) in dimension 3: alpha = 1/2, mu = 3/2.
+    const r12 = m.polytopeNormDensities("vertices", 6, 3,
+        ["1","0","0","-1","0","0","0","1","0","0","-1","0","0","0","1","0","0","-1"], "both");
+    console.log("polynorm octahedron :", JSON.stringify({alpha: r12.alpha, mu: r12.mu,
+        packingDensity: r12.packingDensity, coveringDensity: r12.coveringDensity,
+        groupOrder: r12.groupOrder, error: r12.error}));
+    if (r12.error || r12.alpha !== "1/2" || r12.mu !== "3/2") process.exit(1);
+    // Unbounded inequality system.
+    const r13 = m.polytopeNormDensities("inequalities", 2, 2, ["1","0","0","1"], "both");
+    console.log("polynorm unbounded :", JSON.stringify({error: r13.error}));
+    if (!r13.error) { console.error("expected an error"); process.exit(1); }
 
     console.log("smoke test OK");
 });

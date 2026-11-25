@@ -2,8 +2,8 @@
 //
 // WebAssembly bindings (Emscripten / embind) exposing selected entry points
 // of polyhedral_common to JavaScript: copositivity, copositive factorization,
-// shortest-vector realizability and automorphism group, and Gram-matrix
-// canonicalization.
+// shortest-vector realizability and automorphism group, Gram-matrix
+// canonicalization, and the packing and covering densities of a polytope.
 //
 // JS API (after loading the module):
 //   const m = await createPolyhedralModule();
@@ -29,6 +29,9 @@
 #include "StrictPositivity.h"
 #include "SHORT_Realizability.h"
 #include "LatticeStabEquiCan.h"
+#include "POLY_DirectTriangulation.h"
+#include "PolyNorm_Packing.h"
+#include "PolyNorm_Covering.h"
 // clang-format on
 
 #include <emscripten/bind.h>
@@ -490,7 +493,7 @@ CanonicalFormResultJS gramCanonicalForm(int n, emscripten::val const &entries_va
                         "Gram-matrix canonicalization requires a positive-definite form.";
             return out;
         }
-        MyMatrix<cpp_int> B = ComputeCanonicalForm<cpp_rational, cpp_int>(M, sink);
+        MyMatrix<cpp_int> B = ComputeCanonicalForm<cpp_rational, cpp_int, Tgroup>(M, sink);
         MyMatrix<cpp_rational> B_T = UniversalMatrixConversion<cpp_rational, cpp_int>(B);
         MyMatrix<cpp_rational> canonical = B_T * M * B_T.transpose();
 
@@ -509,6 +512,249 @@ CanonicalFormResultJS gramCanonicalForm(int n, emscripten::val const &entries_va
     } catch (TerminalException const &) {
         out.error = formatPolyhedralError(sink,
             "polyhedral_common reported a fatal error during Gram-matrix canonicalization");
+    } catch (std::exception const &e) {
+        out.error = std::string("Internal error: ") + e.what();
+    } catch (...) {
+        out.error = formatPolyhedralError(sink, "Unknown internal error");
+    }
+    return out;
+}
+
+// Result of polytopeNormDensities: the packing and covering of R^n by the
+// translates alpha P + Z^n and mu P + Z^n of a polytope P. All values are
+// exact rationals, as strings. The vertices are in the input coordinates.
+struct PolyNormResultJS {
+    int dim;
+    int nVertices;
+    int nFacets;
+    std::vector<std::string> verticesFlat;  // nVertices * dim, row-major
+    std::string volume;
+    std::string groupOrder;                 // |{A in GL_n(Z) : PA = P}|
+    bool hasPacking;
+    std::string alpha;                      // packing scalar
+    std::string packingDensity;             // alpha^n vol(P)
+    int nContacts;
+    std::vector<std::string> contactsFlat;  // nContacts * dim, row-major
+    bool hasCovering;
+    std::string mu;                         // covering radius
+    std::string coveringDensity;            // mu^n vol(P)
+    std::vector<std::string> lastCoveredPoint;
+    int nTight;
+    std::vector<std::string> tightFlat;     // nTight * dim: z on the boundary of p - mu P
+    std::string error;
+};
+
+// Parse a rectangular matrix of rationals (one vector per row).
+static bool buildRationalMatrix(int nRows, int nCols, emscripten::val const &entries_val,
+                                MyMatrix<cpp_rational> &M, std::string &out_error) {
+    if (nRows <= 0 || nCols <= 0) {
+        out_error = "The number of vectors and the dimension must be positive";
+        return false;
+    }
+    const unsigned expected = static_cast<unsigned>(nRows) * static_cast<unsigned>(nCols);
+    const unsigned got = entries_val["length"].as<unsigned>();
+    if (got != expected) {
+        out_error = "Entries length (" + std::to_string(got) +
+                    ") does not match nRows*nCols (" + std::to_string(expected) + ")";
+        return false;
+    }
+    M.resize(nRows, nCols);
+    for (int i = 0; i < nRows; ++i) {
+        for (int j = 0; j < nCols; ++j) {
+            std::string s = entries_val[static_cast<unsigned>(i) * nCols + j].as<std::string>();
+            try {
+                M(i, j) = parse_rational(s);
+            } catch (std::exception const &) {
+                out_error = "Could not parse entry v" + std::to_string(i + 1) + "[" +
+                            std::to_string(j + 1) + "] = \"" + s + "\"";
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static MyMatrix<cpp_rational> homogenize(MyMatrix<cpp_rational> const &V) {
+    MyMatrix<cpp_rational> EXT(V.rows(), V.cols() + 1);
+    for (int i = 0; i < V.rows(); ++i) {
+        EXT(i, 0) = 1;
+        for (int j = 0; j < V.cols(); ++j) EXT(i, j + 1) = V(i, j);
+    }
+    return EXT;
+}
+
+// The vertices of P = {x : v_i . x <= 1}. P is bounded exactly when 0 is in
+// the interior of conv(v_i), and then P is the polar of conv(v_i): its
+// vertices are the facets a . y <= 1 of conv(v_i).
+static bool verticesFromInequalities(MyMatrix<cpp_rational> const &V,
+                                     MyMatrix<cpp_rational> &EXT, std::string &out_error,
+                                     std::ostream &os) {
+    int n = V.cols();
+    MyMatrix<cpp_rational> EXTv = homogenize(V);
+    if (RankMat(EXTv) != n + 1) {
+        out_error = "The normals v_i do not span an n-dimensional polytope: "
+                    "the inequalities do not define a bounded polytope";
+        return false;
+    }
+    MyMatrix<cpp_rational> FAC =
+        DirectFacetComputationInequalities_General(EXTv, "cdd", os);
+    // A facet w_0 + w . y >= 0 of conv(v_i) with w_0 > 0 gives the vertex -w / w_0.
+    EXT.resize(FAC.rows(), n + 1);
+    for (int i = 0; i < FAC.rows(); ++i) {
+        if (FAC(i, 0) <= 0) {
+            out_error = "0 is not in the interior of conv(v_1, ..., v_M): "
+                        "the inequalities v_i . x <= 1 define an unbounded set";
+            return false;
+        }
+        EXT(i, 0) = 1;
+        for (int j = 0; j < n; ++j) EXT(i, j + 1) = -FAC(i, j + 1) / FAC(i, 0);
+    }
+    return true;
+}
+
+// The vertices of the zonotope v_1 [0,1] + ... + v_M [0,1]. The generators
+// are added one at a time, and once the point set is full dimensional it is
+// reduced to its vertices, so that its size stays that of the zonotope.
+static bool verticesFromZonotope(MyMatrix<cpp_rational> const &V,
+                                 MyMatrix<cpp_rational> &EXT, std::string &out_error,
+                                 std::ostream &os) {
+    int n = V.cols();
+    std::vector<MyVector<cpp_rational>> pts{ZeroVector<cpp_rational>(n)};
+    for (int i = 0; i < V.rows(); ++i) {
+        MyVector<cpp_rational> g = GetMatrixRow(V, i);
+        if (IsZeroVector(g)) continue;
+        std::unordered_set<MyVector<cpp_rational>> seen(pts.begin(), pts.end());
+        size_t n_pt = pts.size();
+        for (size_t k = 0; k < n_pt; ++k) {
+            MyVector<cpp_rational> q = pts[k] + g;
+            if (seen.insert(q).second) pts.push_back(q);
+        }
+        MyMatrix<cpp_rational> EXTp = homogenize(MatrixFromVectorFamily(pts));
+        if (RankMat(EXTp) == n + 1) {
+            std::vector<MyVector<cpp_rational>> red;
+            for (int idx : get_distinct_extreme_rays_indices(EXTp, os)) red.push_back(pts[idx]);
+            pts = std::move(red);
+        }
+    }
+    EXT = homogenize(MatrixFromVectorFamily(pts));
+    if (RankMat(EXT) != n + 1) {
+        out_error = "The generators v_i do not span R^n: the zonotope is not full dimensional";
+        return false;
+    }
+    return true;
+}
+
+static std::string toStr(cpp_rational const &x) {
+    std::ostringstream oss;
+    oss << x;
+    return oss.str();
+}
+
+static cpp_rational powRational(cpp_rational const &x, int n) {
+    cpp_rational r(1);
+    for (int i = 0; i < n; ++i) r *= x;
+    return r;
+}
+
+// Packing and covering of R^n by the translates of the polytope P along Z^n.
+//   inputType : "vertices"     P = conv(v_1, ..., v_M)
+//               "inequalities" P = {x : v_i . x <= 1}
+//               "zonotope"     P = v_1 [0,1] + ... + v_M [0,1]
+//   what      : "both", "packing" or "covering"
+// The rows of the nRows x nCols matrix `entries` are the v_i.
+PolyNormResultJS polytopeNormDensities(std::string const &inputType, int nRows, int nCols,
+                                       emscripten::val const &entries_val,
+                                       std::string const &what) {
+    PolyNormResultJS out;
+    out.dim = 0;
+    out.nVertices = 0;
+    out.nFacets = 0;
+    out.hasPacking = false;
+    out.nContacts = 0;
+    out.hasCovering = false;
+    out.nTight = 0;
+    std::ostringstream sink;
+    CerrRedirect redir(sink);
+    try {
+        bool doPacking = what == "both" || what == "packing";
+        bool doCovering = what == "both" || what == "covering";
+        if (!doPacking && !doCovering) {
+            out.error = "Unknown computation \"" + what + "\", allowed: both, packing, covering";
+            return out;
+        }
+        MyMatrix<cpp_rational> V;
+        if (!buildRationalMatrix(nRows, nCols, entries_val, V, out.error)) return out;
+        int n = nCols;
+        MyMatrix<cpp_rational> EXT;
+        if (inputType == "vertices") {
+            EXT = homogenize(V);
+            if (RankMat(EXT) != n + 1) {
+                out.error = "The points do not span an n-dimensional polytope";
+                return out;
+            }
+        } else if (inputType == "inequalities") {
+            if (!verticesFromInequalities(V, EXT, out.error, sink)) return out;
+        } else if (inputType == "zonotope") {
+            if (!verticesFromZonotope(V, EXT, out.error, sink)) return out;
+        } else {
+            out.error = "Unknown input type \"" + inputType +
+                        "\", allowed: vertices, inequalities, zonotope";
+            return out;
+        }
+        PolyNormData<cpp_rational, cpp_int, Tgroup> data =
+            PolyNorm_BuildData<cpp_rational, cpp_int, Tgroup>(EXT, sink);
+        out.dim = n;
+        out.nVertices = data.EXT.rows();
+        out.nFacets = data.Lmat.rows();
+        for (int i = 0; i < data.EXT.rows(); ++i) {
+            for (int j = 0; j < n; ++j) {
+                out.verticesFlat.push_back(toStr(data.EXT(i, j + 1) + data.center(j)));
+            }
+        }
+        cpp_rational vol =
+            DirectVolumePolytope(data.EXT, TriangulationProgram::lrs, sink);
+        out.volume = toStr(vol);
+        {
+            std::ostringstream oss;
+            oss << data.GRP.size();
+            out.groupOrder = oss.str();
+        }
+        if (doPacking) {
+            PolyNormPacking<cpp_rational, cpp_int> res =
+                ComputePolyNormPacking<cpp_rational, cpp_int>(data.LmatDiff, sink);
+            out.hasPacking = true;
+            out.alpha = toStr(res.alpha);
+            out.packingDensity = toStr(powRational(res.alpha, n) * vol);
+            out.nContacts = static_cast<int>(res.ListContact.size());
+            for (auto const &z : res.ListContact) {
+                for (int j = 0; j < n; ++j) {
+                    std::ostringstream oss;
+                    oss << z(j);
+                    out.contactsFlat.push_back(oss.str());
+                }
+            }
+        }
+        if (doCovering) {
+            PolyNormCovering<cpp_rational, cpp_int> res =
+                ComputePolyNormCovering<cpp_rational, cpp_int, Tgroup>(data, sink);
+            out.hasCovering = true;
+            out.mu = toStr(res.mu);
+            out.coveringDensity = toStr(powRational(res.mu, n) * vol);
+            for (int j = 0; j < n; ++j) {
+                out.lastCoveredPoint.push_back(toStr(res.p(j) + data.center(j)));
+            }
+            out.nTight = static_cast<int>(res.ListTight.size());
+            for (auto const &ePair : res.ListTight) {
+                for (int j = 0; j < n; ++j) {
+                    std::ostringstream oss;
+                    oss << ePair.z(j);
+                    out.tightFlat.push_back(oss.str());
+                }
+            }
+        }
+    } catch (TerminalException const &) {
+        out.error = formatPolyhedralError(sink,
+            "polyhedral_common reported a fatal error during the packing / covering computation");
     } catch (std::exception const &e) {
         out.error = std::string("Internal error: ") + e.what();
     } catch (...) {
@@ -551,6 +797,26 @@ EMSCRIPTEN_BINDINGS(polyhedral_module) {
         .field("canonicalFlat", &CanonicalFormResultJS::canonicalFlat)
         .field("error", &CanonicalFormResultJS::error);
 
+    emscripten::value_object<PolyNormResultJS>("PolyNormResult")
+        .field("dim", &PolyNormResultJS::dim)
+        .field("nVertices", &PolyNormResultJS::nVertices)
+        .field("nFacets", &PolyNormResultJS::nFacets)
+        .field("verticesFlat", &PolyNormResultJS::verticesFlat)
+        .field("volume", &PolyNormResultJS::volume)
+        .field("groupOrder", &PolyNormResultJS::groupOrder)
+        .field("hasPacking", &PolyNormResultJS::hasPacking)
+        .field("alpha", &PolyNormResultJS::alpha)
+        .field("packingDensity", &PolyNormResultJS::packingDensity)
+        .field("nContacts", &PolyNormResultJS::nContacts)
+        .field("contactsFlat", &PolyNormResultJS::contactsFlat)
+        .field("hasCovering", &PolyNormResultJS::hasCovering)
+        .field("mu", &PolyNormResultJS::mu)
+        .field("coveringDensity", &PolyNormResultJS::coveringDensity)
+        .field("lastCoveredPoint", &PolyNormResultJS::lastCoveredPoint)
+        .field("nTight", &PolyNormResultJS::nTight)
+        .field("tightFlat", &PolyNormResultJS::tightFlat)
+        .field("error", &PolyNormResultJS::error);
+
     emscripten::register_vector<std::string>("VectorString");
 
     emscripten::function("testCopositivity", &testCopositivity);
@@ -559,4 +825,5 @@ EMSCRIPTEN_BINDINGS(polyhedral_module) {
     emscripten::function("testShortestVectorsRealizability", &testShortestVectorsRealizability);
     emscripten::function("shortestVectorsAutomorphismGroup", &shortestVectorsAutomorphismGroup);
     emscripten::function("gramCanonicalForm", &gramCanonicalForm);
+    emscripten::function("polytopeNormDensities", &polytopeNormDensities);
 }
