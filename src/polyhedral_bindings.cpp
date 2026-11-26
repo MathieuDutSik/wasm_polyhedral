@@ -3,8 +3,8 @@
 // WebAssembly bindings (Emscripten / embind) exposing selected entry points
 // of polyhedral_common to JavaScript: copositivity, copositive factorization,
 // shortest-vector realizability and automorphism group, Gram-matrix
-// canonicalization, the packing and covering densities of a polytope, and
-// minimal covering polytopes.
+// canonicalization, the packing and covering densities of a polytope,
+// minimal covering polytopes, and the covering radius along a Minkowski path.
 //
 // JS API (after loading the module):
 //   const m = await createPolyhedralModule();
@@ -34,6 +34,7 @@
 #include "PolyNorm_Packing.h"
 #include "PolyNorm_Covering.h"
 #include "PolyNorm_MinimalCovering.h"
+#include "PolyNorm_CoveringPath.h"
 // clang-format on
 
 #include <emscripten/bind.h>
@@ -964,6 +965,65 @@ MinimalCoveringResultJS minimalCoveringPolytope(std::string const &inputType, in
     return out;
 }
 
+// Result of coveringPath: the function f(lambda) = 1 / mu(lambda K1 +
+// (1 - lambda) K2) on [0,1], continuous and piecewise affine, as its pieces
+// f = s0 + s1 lambda on [alpha, beta], consecutive and each one proved.
+struct CoveringPathResultJS {
+    int dim;
+    int nPieces;
+    std::vector<std::string> piecesFlat;     // nPieces * 4: alpha, beta, s0, s1
+    std::string description;                 // statistics of the search
+    std::string error;
+};
+
+// The covering radius along the Minkowski path between K1 and K2, given as
+// for polytopeNormDensities (same dimension nCols). PolyNorm_ComputeCoveringPath
+// computes 1 / mu((1 - lambda) P1 + lambda P2), so P1 = K2 and P2 = K1.
+CoveringPathResultJS coveringPath(std::string const &inputType1, int nRows1,
+                                  emscripten::val const &entries1,
+                                  std::string const &inputType2, int nRows2,
+                                  emscripten::val const &entries2, int nCols) {
+    CoveringPathResultJS out;
+    out.dim = 0;
+    out.nPieces = 0;
+    std::ostringstream sink;
+    CerrRedirect redir(sink);
+    try {
+        MyMatrix<cpp_rational> EXT1, EXT2;
+        if (!buildPolytope(inputType1, nRows1, nCols, entries1, EXT1, out.error, sink)) {
+            out.error = "K1: " + out.error;
+            return out;
+        }
+        if (!buildPolytope(inputType2, nRows2, nCols, entries2, EXT2, out.error, sink)) {
+            out.error = "K2: " + out.error;
+            return out;
+        }
+        PolyNormCoveringPath<cpp_rational> res =
+            PolyNorm_ComputeCoveringPath<cpp_rational, cpp_int, Tgroup>(EXT2, EXT1, sink);
+        out.dim = nCols;
+        out.nPieces = static_cast<int>(res.ListPiece.size());
+        for (auto const &P : res.ListPiece) {
+            out.piecesFlat.push_back(toStr(P.alpha));
+            out.piecesFlat.push_back(toStr(P.beta));
+            out.piecesFlat.push_back(toStr(P.s0));
+            out.piecesFlat.push_back(toStr(P.s1));
+        }
+        std::ostringstream desc;
+        desc << "Search: " << res.n_evaluation << " exact evaluations, "
+             << res.n_certificate << " certificates, " << res.n_node << " nodes, "
+             << res.n_lp << " linear programs.";
+        out.description = desc.str();
+    } catch (TerminalException const &) {
+        out.error = formatPolyhedralError(sink,
+            "polyhedral_common reported a fatal error during the covering path computation");
+    } catch (std::exception const &e) {
+        out.error = std::string("Internal error: ") + e.what();
+    } catch (...) {
+        out.error = formatPolyhedralError(sink, "Unknown internal error");
+    }
+    return out;
+}
+
 EMSCRIPTEN_BINDINGS(polyhedral_module) {
     emscripten::value_object<CopositivityResultJS>("CopositivityResult")
         .field("isCopositive", &CopositivityResultJS::isCopositive)
@@ -1045,6 +1105,13 @@ EMSCRIPTEN_BINDINGS(polyhedral_module) {
         .field("volume", &MinimalCoveringResultJS::volume)
         .field("error", &MinimalCoveringResultJS::error);
 
+    emscripten::value_object<CoveringPathResultJS>("CoveringPathResult")
+        .field("dim", &CoveringPathResultJS::dim)
+        .field("nPieces", &CoveringPathResultJS::nPieces)
+        .field("piecesFlat", &CoveringPathResultJS::piecesFlat)
+        .field("description", &CoveringPathResultJS::description)
+        .field("error", &CoveringPathResultJS::error);
+
     emscripten::register_vector<std::string>("VectorString");
 
     emscripten::function("testCopositivity", &testCopositivity);
@@ -1056,4 +1123,5 @@ EMSCRIPTEN_BINDINGS(polyhedral_module) {
     emscripten::function("polytopeNormDensities", &polytopeNormDensities);
     emscripten::function("isMinimalCovering", &isMinimalCovering);
     emscripten::function("minimalCoveringPolytope", &minimalCoveringPolytope);
+    emscripten::function("coveringPath", &coveringPath);
 }

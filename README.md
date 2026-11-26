@@ -33,6 +33,7 @@ holding every WASM entry point. Each entry registers via
 | `polytopeNormDensities`                | `ComputePolyNormPacking`, `ComputePolyNormCovering` |
 | `isMinimalCovering`                    | `PolyNorm_IsMinimalCovering`             |
 | `minimalCoveringPolytope`              | `PolyNorm_MinimalCoveringPolytopeGrid`, `PolyNorm_MinimalCoveringPolytope` |
+| `coveringPath`                         | `PolyNorm_ComputeCoveringPath`           |
 
 ## Building locally
 

@@ -28,7 +28,10 @@ if [ ! -d "$POLYHEDRAL_COMMON/src_copos" ]; then
     exit 1
 fi
 
-BCPP="$POLYHEDRAL_COMMON/basic_common_cpp"
+# basic_common_cpp defaults to the submodule of polyhedral_common; override
+# with BASIC_COMMON_CPP to build against another checkout, e.g. one with a fix
+# that the submodule pointer does not have yet.
+BCPP="${BASIC_COMMON_CPP:-$POLYHEDRAL_COMMON/basic_common_cpp}"
 BOOST_INC="${BOOST_INC:-/opt/homebrew/opt/boost/include}"
 EIGEN_INC="${EIGEN_INC:-/opt/homebrew/include/eigen3}"
 
@@ -283,6 +286,17 @@ create().then(m => {
     console.log("mincov reduction rectangle :", JSON.stringify({isMinimal: r18.isMinimal,
         volume: r18.volume, error: r18.error}));
     if (r18.error || !r18.isMinimal) process.exit(1);
+
+    // Covering radius along a Minkowski path, the parallelograms of
+    // Codenotti, Freyer, Krivokuca: f(lambda) = 1/mu(lambda K1 + (1-lambda) K2)
+    // has 4 pieces with break points 7/24, 1/2, 17/24 and f(1/2) = 11/12.
+    const k1 = ["0","0","1","1","-3/2","-1/2","-1/2","1/2"];
+    const k2 = ["0","0","1","0","1/2","1","3/2","1"];
+    const r19 = m.coveringPath("vertices", 4, k1, "vertices", 4, k2, 2);
+    const pieces = flat(r19.piecesFlat);
+    console.log("path cfk :", JSON.stringify({pieces, error: r19.error}));
+    if (r19.error || r19.nPieces !== 4 || pieces[1] !== "7/24" || pieces[5] !== "1/2"
+        || pieces[9] !== "17/24") process.exit(1);
 
     console.log("smoke test OK");
 });
